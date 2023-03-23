@@ -2,6 +2,7 @@
 import argparse
 import os
 import random
+from shutil import copyfile
 import time
 from distutils.util import strtobool
 
@@ -18,6 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 # ROS
 import rospy
 from ur3e_openai.common import load_environment, log_ros_params, clear_gym_params, load_ros_params
+from ur3e_openai.initialize_logger import initialize_logger
 
 
 def parse_args():
@@ -37,7 +39,7 @@ def parse_args():
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=False,
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
@@ -91,6 +93,15 @@ def make_env(env_id, seed, idx, capture_video, run_name):
     return thunk
 
 
+def store_checkpoint():
+    torch.save({
+            'epoch': EPOCH,
+            'model_state_dict': net.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': LOSS,
+            }, PATH)
+
+
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
@@ -118,8 +129,7 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
-        
-        print("action space", env.action_space)
+
         # action rescaling
         self.register_buffer(
             "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
@@ -180,8 +190,8 @@ if __name__ == "__main__":
 
     ros_env_id = rospy.get_param('ur3e_gym/env_id')
     load_environment(ros_env_id,
-                           max_episode_steps=episode_max_steps,
-                           register_only=True)
+                     max_episode_steps=episode_max_steps,
+                     register_only=True)
 
     ##### Start Training #####
 
@@ -198,22 +208,37 @@ if __name__ == "__main__":
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
+
+    outdir = f"runs/{run_name}"
+
+    writer = SummaryWriter(outdir)
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
+    log_ros_params(outdir)
+    copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+    logger = initialize_logger(log_tag="cleanrl", filename=outdir + "/training_log.log")
+    p_seed = rospy.get_param("ur3e_gym/seed", args.seed)
+    p_batch_size = rospy.get_param("ur3e_gym/batch_size", args.batch_size)
+    p_policy_lr = rospy.get_param("ur3e_gym/policy_lr", args.policy_lr)
+
+    p_alpha = rospy.get_param("ur3e_gym/alpha", args.alpha)
+    p_autotune = rospy.get_param("ur3e_gym/auto_alpha", args.autotune)
+
+    p_warmup = rospy.get_param("ur3e_gym/warmup", args.learning_starts)
+
     # TRY NOT TO MODIFY: seeding
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    random.seed(p_seed)
+    np.random.seed(p_seed)
+    torch.manual_seed(p_seed)
     torch.backends.cudnn.deterministic = args.torch_deterministic
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(ros_env_id, args.seed, 0, args.capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv([make_env(ros_env_id, p_seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
@@ -226,16 +251,16 @@ if __name__ == "__main__":
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=p_policy_lr)
 
     # Automatic entropy tuning
-    if args.autotune:
+    if p_autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
-        alpha = args.alpha
+        alpha = p_alpha
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -250,8 +275,9 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
     for global_step in range(args.total_timesteps):
+        st = rospy.get_time()
         # ALGO LOGIC: put action logic here
-        if global_step < args.learning_starts:
+        if global_step < p_warmup:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
@@ -263,7 +289,13 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         for info in infos:
             if "episode" in info.keys():
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                # Compute episodes metrics
+                time_per_step = rospy.get_time() - st / info["episode"]["l"]
+                
+                # Reset variables
+                st = rospy.get_time()
+                
+                logger.warn(f"Total steps:{global_step:>10}, # steps:{info['episode']['l']:>4}, episodic_return:{info['episode']['r']:>8.2f}, TPS:{time_per_step:>5.3f}")
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
@@ -279,8 +311,8 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
+        if global_step > p_warmup:
+            data = rb.sample(p_batch_size)
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
@@ -337,8 +369,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                writer.add_scalar("charts/SPS", int(global_step / (rospy.get_time() - start_time)), global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 

@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
+
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import argparse
 import os
@@ -15,11 +18,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
+import yaml
 
 # ROS
 import rospy
 from ur3e_openai.common import load_environment, log_ros_params, clear_gym_params, load_ros_params
 from ur3e_openai.initialize_logger import initialize_logger
+from ur3e_openai.prepare_output_dir import prepare_output_dir
 
 
 def parse_args():
@@ -35,7 +40,11 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL",
+    parser.add_argument('--save-summary-interval', type=int, default=int(1e3),
+        help='Interval to save summary')
+    parser.add_argument("--save-model-interval", type=int, default=int(5e3),
+        help="Interval to save model")    
+    parser.add_argument("--wandb-project-name", type=str, default="trufus",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -45,6 +54,8 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="HopperBulletEnv-v0",
         help="the id of the environment")
+    parser.add_argument("--ros-params-file", type=str, default="",
+        help="(Optional) for multiple test, specify the path to the unique parameters")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
@@ -85,21 +96,12 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         if capture_video:
             if idx == 0:
                 env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env.seed(seed)
+        env.seed(seed) # depricated
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
         return env
 
     return thunk
-
-
-def store_checkpoint():
-    torch.save({
-            'epoch': EPOCH,
-            'model_state_dict': net.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': LOSS,
-            }, PATH)
 
 
 # ALGO LOGIC: initialize agent here:
@@ -182,9 +184,19 @@ if __name__ == "__main__":
     else:
         raise Exception("invalid env_id")
 
-    ros_param_path = load_ros_params(rospackage_name="ur3e_rl",
-                                     rel_path_from_package_to_file="config",
-                                     yaml_file_name=param_file)
+    if args.ros_params_file:
+        # Load common parameters
+        common_ros_param_path = load_ros_params(rospackage_name="ur3e_rl",
+                                                rel_path_from_package_to_file="config",
+                                                yaml_file_name='simulation/force_control/test/common.yaml')
+        # Then load specific parameters
+        ros_param_path = load_ros_params(rospackage_name="ur3e_rl",
+                                         rel_path_from_package_to_file="config",
+                                         yaml_file_name=args.ros_params_file)
+    else:
+        ros_param_path = load_ros_params(rospackage_name="ur3e_rl",
+                                         rel_path_from_package_to_file="config",
+                                         yaml_file_name=param_file)
 
     episode_max_steps = rospy.get_param("ur3e_gym/steps_per_episode", 200)
 
@@ -195,21 +207,30 @@ if __name__ == "__main__":
 
     ##### Start Training #####
 
-    run_name = f"{ros_env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    experiment_name = f"{ros_env_id}__{args.exp_name}__{int(time.time())}"
+    outdir = f"runs/{experiment_name}"
+    prepare_output_dir(args=args, user_specified_dir=outdir)
+
+    if args.ros_params_file:
+        copyfile(common_ros_param_path, outdir + "/common_ros_gym_env_params.yaml")
+        copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+    else:
+        copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+
     if args.track:
         import wandb
 
-        wandb.init(
+        run = wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
             sync_tensorboard=True,
             config=vars(args),
-            name=run_name,
+            name=experiment_name,
             monitor_gym=True,
             save_code=True,
         )
 
-    outdir = f"runs/{run_name}"
+        wandb.save(f"runs/{experiment_name}/*", base_path=f"runs/{experiment_name}", policy="now")
 
     writer = SummaryWriter(outdir)
     writer.add_text(
@@ -217,16 +238,21 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
+    rospy.set_param('ur3e_gym/output_dir', outdir)
     log_ros_params(outdir)
-    copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+    if args.ros_params_file:
+        copyfile(common_ros_param_path, outdir + "/common_ros_gym_env_params.yaml")
+        copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+    else:
+        copyfile(ros_param_path, outdir + "/ros_gym_env_params.yaml")
+
     logger = initialize_logger(log_tag="cleanrl", filename=outdir + "/training_log.log")
+
     p_seed = rospy.get_param("ur3e_gym/seed", args.seed)
     p_batch_size = rospy.get_param("ur3e_gym/batch_size", args.batch_size)
     p_policy_lr = rospy.get_param("ur3e_gym/policy_lr", args.policy_lr)
-
     p_alpha = rospy.get_param("ur3e_gym/alpha", args.alpha)
     p_autotune = rospy.get_param("ur3e_gym/auto_alpha", args.autotune)
-
     p_warmup = rospy.get_param("ur3e_gym/warmup", args.learning_starts)
 
     # TRY NOT TO MODIFY: seeding
@@ -238,7 +264,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv([make_env(ros_env_id, p_seed, 0, args.capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv([make_env(ros_env_id, p_seed, 0, args.capture_video, experiment_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
@@ -272,10 +298,23 @@ if __name__ == "__main__":
     )
     start_time = time.time()
 
+    if args.track and wandb.run.resumed:
+        api = wandb.Api()
+        run = api.run(f"{run.entity}/{run.project}/{run.id}")
+        model = run.file("last_checkpoint.pt")
+        model.download(f"runs/{experiment_name}/")
+        checkpoint = torch.load(f"runs/{experiment_name}/last_checkpoint.pt", map_location=device)
+        actor.load_state_dict(checkpoint["actor"])
+        qf1.load_state_dict(checkpoint["qf1"])
+        qf2.load_state_dict(checkpoint["qf2"])
+        actor.eval()
+        print(f"Model training resumed")
+
+    st = rospy.get_time()
+    
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
     for global_step in range(args.total_timesteps):
-        st = rospy.get_time()
         # ALGO LOGIC: put action logic here
         if global_step < p_warmup:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -290,14 +329,14 @@ if __name__ == "__main__":
         for info in infos:
             if "episode" in info.keys():
                 # Compute episodes metrics
-                time_per_step = rospy.get_time() - st / info["episode"]["l"]
-                
+                time_per_step = (rospy.get_time() - st) / info["episode"]["l"]
+
                 # Reset variables
                 st = rospy.get_time()
-                
-                logger.warn(f"Total steps:{global_step:>10}, # steps:{info['episode']['l']:>4}, episodic_return:{info['episode']['r']:>8.2f}, TPS:{time_per_step:>5.3f}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+
+                logger.info(f"Total steps:{global_step:>10}, # steps:{info['episode']['l']:>4}, episodic_return:{info['episode']['r']:>8.2f}, TPS:{time_per_step:>5.3f}")
+                writer.add_scalar("Common/training_return", info["episode"]["r"], global_step)
+                writer.add_scalar("Common/training_episode_length", info["episode"]["l"], global_step)
                 break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `terminal_observation`
@@ -361,17 +400,36 @@ if __name__ == "__main__":
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
-                writer.add_scalar("charts/SPS", int(global_step / (rospy.get_time() - start_time)), global_step)
+            if global_step % args.save_model_interval == 0:
+                if not os.path.exists(f"runs/{experiment_name}"):
+                    os.makedirs(f"runs/{experiment_name}")
+                checkpoint_data = {
+                    "actor": actor.state_dict(),
+                    "qf1": qf1.state_dict(),
+                    "qf2": qf2.state_dict(),
+                }
+                torch.save(checkpoint_data, f"runs/{experiment_name}/last_checkpoint.pt")
+                torch.save(checkpoint_data, f"runs/{experiment_name}/checkpoint-step-{global_step}.pt")
+                if args.track:
+                    wandb.save(f"runs/{experiment_name}/last_checkpoint.pt", base_path=f"runs/{experiment_name}", policy="now")
+                    
+            if global_step % args.save_summary_interval == 0:
+                writer.add_scalar("SAC/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("SAC/qf2_values", qf2_a_values.mean().item(), global_step)
+                writer.add_scalar("SAC/critic_loss", qf1_loss.item(), global_step)
+                writer.add_scalar("SAC/qf2_loss", qf2_loss.item(), global_step)
+                writer.add_scalar("SAC/qf_loss", qf_loss.item() / 2.0, global_step)
+                writer.add_scalar("SAC/actor_loss", actor_loss.item(), global_step)
+                writer.add_scalar("SAC/alpha", alpha, global_step)
+                if p_autotune:
+                    writer.add_scalar("SAC/alpha_loss", alpha_loss, global_step)
+
+                # writer.add_scalar("Common/SPS", int(global_step / (rospy.get_time() - start_time)), global_step)
                 if args.autotune:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                    writer.add_scalar("SAC/alpha_loss", alpha_loss.item(), global_step)
 
     envs.close()
     writer.close()
+
+    if args.track:
+        wandb.save(f"runs/{experiment_name}/*.log", base_path=f"runs/{experiment_name}", policy="now")

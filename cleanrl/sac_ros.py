@@ -248,7 +248,7 @@ if __name__ == "__main__":
 
     logger = initialize_logger(log_tag="cleanrl", filename=outdir + "/training_log.log")
 
-    p_seed = rospy.get_param("ur3e_gym/seed", args.seed)
+    p_seed = rospy.get_param("ur3e_gym/rand_seed", args.seed)
     p_batch_size = rospy.get_param("ur3e_gym/batch_size", args.batch_size)
     p_policy_lr = rospy.get_param("ur3e_gym/policy_lr", args.policy_lr)
     p_alpha = rospy.get_param("ur3e_gym/alpha", args.alpha)
